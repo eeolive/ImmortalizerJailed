@@ -292,11 +292,11 @@ static void vibrateDevice() {
     NSString *appName = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleName"];
 
     if (self.isImmortalized) {
-        subtitle = @"Immortalized";
+        subtitle = @"已开启真后台";
         icon = @"hourglass.bottomhalf.fill";
         [self startTimer];
     } else {
-        subtitle = @"At Rest";
+        subtitle = @"正常模式";
         icon = @"arrow.uturn.left.circle.fill";
         [self stopTimer];
     }
