@@ -1,0 +1,128 @@
+name: Sync upstream release and publish Chinese dylib
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/release-zh.yml'
+      - 'localize.py'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: zh-release
+  cancel-in-progress: false
+
+jobs:
+  sync-build-release:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Find newest published upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RELEASE_JSON=$(gh api repos/sergealagon/ImmortalizerJailed/releases/latest)
+          TAG=$(printf '%s' "$RELEASE_JSON" | jq -r '.tag_name')
+          test -n "$TAG"
+          printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+          printf 'release_tag=zh-%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if already released
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.upstream.outputs.release_tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+            echo "$RELEASE_TAG already exists; nothing to do."
+          else
+            echo 'publish=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch upstream release source and apply localization
+        if: steps.check.outputs.publish == 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/sergealagon/ImmortalizerJailed.git
+          git fetch --no-tags upstream "refs/tags/$UPSTREAM_TAG:refs/tags/$UPSTREAM_TAG"
+          # Work in a detached release-tag tree, not the fork's modified main branch.
+          git worktree add --detach upstream-build "$UPSTREAM_TAG"
+          cp localize.py upstream-build/localize.py
+          cd upstream-build
+          python3 localize.py
+          git diff --check
+          git diff -- FloatingButtonWindow.m
+          # Guard against unrelated source modifications in the build tree.
+          test "$(git diff --name-only)" = 'FloatingButtonWindow.m'
+
+      - name: Install Theos
+        if: steps.check.outputs.publish == 'true'
+        uses: Randomblock1/theos-action@v1
+
+      - name: Install the upstream project's iOS SDK
+        if: steps.check.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/theos/sdks.git /tmp/theos-sdks
+          cp -a /tmp/theos-sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
+
+      - name: Build and verify arm64 dylib
+        if: steps.check.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          cd upstream-build
+          make FINALPACKAGE=1 -j"$(sysctl -n hw.ncpu)"
+          test -s .theos/obj/ZImmortalizerJailed.dylib
+          python3 - <<'PY'
+          from pathlib import Path
+          data = Path('.theos/obj/ZImmortalizerJailed.dylib').read_bytes()
+          for value in ('已开启真后台', '正常模式'):
+              assert value.encode('utf-16le') in data, value
+          print('Both translated strings present in compiled dylib.')
+          PY
+          mkdir -p ../dist
+          cp .theos/obj/ZImmortalizerJailed.dylib ../dist/ImmortalizerJailed-zh.dylib
+
+      - name: Sync localized upstream source to fork branch
+        if: steps.check.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          cd upstream-build
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add FloatingButtonWindow.m localize.py
+          git commit -m "Localize upstream ${UPSTREAM_TAG} status labels"
+          git push origin HEAD:refs/heads/zh-upstream
+          printf 'SOURCE_SHA=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+
+      - name: Publish Chinese release
+        if: steps.check.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+          RELEASE_TAG: ${{ steps.upstream.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" dist/ImmortalizerJailed-zh.dylib \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "ImmortalizerJailed $UPSTREAM_TAG 简体中文" \
+            --notes "基于上游正式版 $UPSTREAM_TAG 的原版源码编译，仅汉化状态提示（已开启真后台 / 正常模式）。下载 dylib 后注入目标 IPA，重新签名并安装；它不是独立 App。上游：https://github.com/sergealagon/ImmortalizerJailed/releases/tag/$UPSTREAM_TAG"
